@@ -265,13 +265,13 @@ impl From<InterStreamEnd> for StreamEnd {
 			}
 		}
 
-		if ordered_capture && !mirrored_signatures.is_empty() {
-			if let Some(first_call) = leading_content.iter_mut().find_map(|part| match part {
+		if ordered_capture
+			&& !mirrored_signatures.is_empty()
+			&& let Some(first_call) = leading_content.iter_mut().find_map(|part| match part {
 				ContentPart::ToolCall(call) => Some(call),
 				_ => None,
 			}) {
-				first_call.thought_signatures.get_or_insert(mirrored_signatures);
-			}
+			first_call.thought_signatures.get_or_insert(mirrored_signatures);
 		}
 
 		let mut captured_content = (!leading_content.is_empty()).then(|| MessageContent::from_parts(leading_content));
