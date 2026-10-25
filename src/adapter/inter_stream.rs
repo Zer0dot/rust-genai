@@ -5,7 +5,7 @@
 //!
 //! NOTE: This might be removed at some point as it may not be needed, and we could go directly to the GenAI stream.
 
-use crate::chat::{CustomPart, StopReason, Usage};
+use crate::chat::{ContentPart, CustomPart, StopReason, Usage};
 
 /// One provider reasoning block, in original block order.
 ///
@@ -20,6 +20,8 @@ pub enum InterStreamThoughtBlock {
 	},
 	/// A provider-native block replayed as is (e.g. Anthropic `redacted_thinking`).
 	Custom(CustomPart),
+	/// A text or tool block in the same native ordered stream.
+	Content(ContentPart),
 }
 
 #[derive(Debug, Default)]

@@ -1,7 +1,7 @@
 use super::parse_cache_creation_details;
 use crate::adapter::adapters::support::{StreamerCapturedData, StreamerOptions, new_frame_tap};
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent, InterStreamThoughtBlock};
-use crate::chat::{ChatOptionsSet, CustomPart, PromptTokensDetails, StopReason, ToolCall, Usage};
+use crate::chat::{ChatOptionsSet, ContentPart, CustomPart, PromptTokensDetails, StopReason, ToolCall, Usage};
 use crate::webc::{Event, EventSourceStream};
 use crate::{Error, ModelIden, Result};
 use serde_json::{Map, Value};
@@ -27,7 +27,7 @@ pub struct AnthropicStreamer {
 }
 
 enum InProgressBlock {
-	Text,
+	Text(Option<String>),
 	ToolUse { id: String, name: String, input: String },
 	Thinking(ThinkingBlock),
 }
@@ -83,7 +83,7 @@ impl AnthropicStreamer {
 			options: StreamerOptions::new(model_iden, options_set),
 			captured_data: Default::default(),
 			captured_thought_blocks: Vec::new(),
-			in_progress_block: InProgressBlock::Text,
+			in_progress_block: InProgressBlock::Text(None),
 			pending_events: VecDeque::new(),
 			warned_unreplayable_thinking: false,
 		}
@@ -136,7 +136,16 @@ impl futures::Stream for AnthropicStreamer {
 								})?;
 
 							match data.x_get_str("/content_block/type") {
-								Ok("text") => self.in_progress_block = InProgressBlock::Text,
+								Ok("text") => {
+									let text = data.x_take::<String>("/content_block/text").unwrap_or_default();
+									self.in_progress_block = InProgressBlock::Text(Some(text.clone()));
+									if self.options.capture_content && !text.is_empty() {
+										self.captured_data.content.get_or_insert_with(String::new).push_str(&text);
+									}
+									if !text.is_empty() {
+										return Poll::Ready(Some(Ok(InterStreamEvent::Chunk(text))));
+									}
+								}
 								Ok("thinking") => {
 									let thinking = data.x_take::<String>("/content_block/thinking").unwrap_or_default();
 									let signature =
@@ -230,12 +239,14 @@ impl futures::Stream for AnthropicStreamer {
 									serde_error,
 								})?;
 
+							let capture_content = self.options.capture_content;
 							match &mut self.in_progress_block {
-								InProgressBlock::Text => {
+								InProgressBlock::Text(text) => {
 									let content: String = data.x_take("/delta/text")?;
 
 									// Add to the captured_content if chat options say so
-									if self.options.capture_content {
+									if capture_content {
+										text.get_or_insert_with(String::new).push_str(&content);
 										match self.captured_data.content {
 											Some(ref mut c) => c.push_str(&content),
 											None => self.captured_data.content = Some(content.clone()),
@@ -287,12 +298,16 @@ impl futures::Stream for AnthropicStreamer {
 							}
 						}
 						"content_block_stop" => {
-							match std::mem::replace(&mut self.in_progress_block, InProgressBlock::Text) {
+							match std::mem::replace(&mut self.in_progress_block, InProgressBlock::Text(None)) {
 								InProgressBlock::ToolUse { id, name, input } => {
 									// ToolCallChunks were already emitted incrementally
 									// during content_block_start and content_block_delta.
 									// Here we only finalize capture with parsed arguments.
 									self.capture_tool_call(id, name, input, false);
+								}
+								InProgressBlock::Text(Some(text)) if self.options.capture_content => {
+									self.captured_thought_blocks
+										.push(InterStreamThoughtBlock::Content(ContentPart::Text(text)));
 								}
 								InProgressBlock::Thinking(thinking_block) => {
 									if let Some(block) = thinking_block.into_thought_block() {
@@ -316,10 +331,15 @@ impl futures::Stream for AnthropicStreamer {
 							// A `tool_use` block cut short (e.g., by `max_tokens`) gets no
 							// `content_block_stop`, so its call is captured here, with its
 							// input as far as it got.
-							if let InProgressBlock::ToolUse { id, name, input } =
-								std::mem::replace(&mut self.in_progress_block, InProgressBlock::Text)
-							{
-								self.capture_tool_call(id, name, input, true);
+							match std::mem::replace(&mut self.in_progress_block, InProgressBlock::Text(None)) {
+								InProgressBlock::ToolUse { id, name, input } => {
+									self.capture_tool_call(id, name, input, true)
+								}
+								InProgressBlock::Text(Some(text)) if self.options.capture_content => {
+									self.captured_thought_blocks
+										.push(InterStreamThoughtBlock::Content(ContentPart::Text(text)));
+								}
+								_ => {}
 							}
 
 							// Capture the usage
@@ -529,6 +549,9 @@ impl AnthropicStreamer {
 			thought_signatures: None,
 		};
 
+		self.captured_thought_blocks
+			.push(InterStreamThoughtBlock::Content(ContentPart::ToolCall(tc.clone())));
+
 		match self.captured_data.tool_calls {
 			Some(ref mut t) => t.push(tc),
 			None => self.captured_data.tool_calls = Some(vec![tc]),
@@ -548,7 +571,7 @@ mod tests {
 		}
 		match block.into_thought_block()? {
 			InterStreamThoughtBlock::Signed { signature, .. } => Some(signature),
-			InterStreamThoughtBlock::Custom(_) => None,
+			InterStreamThoughtBlock::Custom(_) | InterStreamThoughtBlock::Content(_) => None,
 		}
 	}
 

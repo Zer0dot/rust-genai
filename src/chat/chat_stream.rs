@@ -222,10 +222,8 @@ impl From<InterStreamEnd> for StreamEnd {
 		let mut captured_tool_calls = inter_end.captured_tool_calls;
 
 		// -- create public captured_content
-		// Ordering policy: paired ThoughtSignature/ReasoningContent blocks and custom
-		// thought blocks (in their original order), then unpaired signatures, text, and
-		// tool calls. Provider adapters can scan the leading parts to reconstruct their
-		// native continuation blocks.
+		// Native ordered streams include text/tools alongside their thinking blocks.
+		let mut ordered_capture = false;
 		let mut leading_content: Vec<ContentPart> = Vec::new();
 		if let Some(captured_blocks) = inter_end.captured_thought_blocks {
 			for block in captured_blocks {
@@ -241,6 +239,10 @@ impl From<InterStreamEnd> for StreamEnd {
 					}
 					InterStreamThoughtBlock::Custom(custom_part) => {
 						leading_content.push(ContentPart::Custom(custom_part))
+					}
+					InterStreamThoughtBlock::Content(part) => {
+						ordered_capture = true;
+						leading_content.push(part);
 					}
 				}
 			}
@@ -259,12 +261,21 @@ impl From<InterStreamEnd> for StreamEnd {
 			if let Some(tool_calls) = captured_tool_calls.as_mut()
 				&& let Some(first_call) = tool_calls.first_mut()
 			{
+				first_call.thought_signatures.get_or_insert(mirrored_signatures.clone());
+			}
+		}
+
+		if ordered_capture && !mirrored_signatures.is_empty() {
+			if let Some(first_call) = leading_content.iter_mut().find_map(|part| match part {
+				ContentPart::ToolCall(call) => Some(call),
+				_ => None,
+			}) {
 				first_call.thought_signatures.get_or_insert(mirrored_signatures);
 			}
 		}
 
 		let mut captured_content = (!leading_content.is_empty()).then(|| MessageContent::from_parts(leading_content));
-		if let Some(captured_text_content) = captured_text_content {
+		if let Some(captured_text_content) = captured_text_content.filter(|_| !ordered_capture) {
 			// This `captured_text_content` is the concatenation of all text chunks received.
 			if let Some(existing_content) = &mut captured_content {
 				existing_content.extend(MessageContent::from_text(captured_text_content));
@@ -272,7 +283,7 @@ impl From<InterStreamEnd> for StreamEnd {
 				captured_content = Some(MessageContent::from_text(captured_text_content));
 			}
 		}
-		if let Some(captured_tool_calls) = captured_tool_calls {
+		if let Some(captured_tool_calls) = captured_tool_calls.filter(|_| !ordered_capture) {
 			if let Some(existing_content) = &mut captured_content {
 				existing_content.extend(MessageContent::from_tool_calls(captured_tool_calls));
 			} else {
@@ -449,6 +460,53 @@ mod tests {
 			sink.ends.load(Ordering::Relaxed),
 			0,
 			"on_end should not follow on_error for the same stream"
+		);
+	}
+
+	#[test]
+	fn ordered_capture_keeps_text_and_tools_in_place_without_aggregate_duplicates() {
+		let call = ToolCall {
+			call_id: "call".into(),
+			fn_name: "lookup".into(),
+			fn_arguments: serde_json::json!({"q":1}),
+			thought_signatures: None,
+		};
+		let end = StreamEnd::from(InterStreamEnd {
+			captured_text_content: Some("beforeafter".into()),
+			captured_tool_calls: Some(vec![call.clone()]),
+			captured_thought_blocks: Some(vec![
+				InterStreamThoughtBlock::Signed {
+					reasoning_content: Some("one".into()),
+					signature: "sig-a".into(),
+				},
+				InterStreamThoughtBlock::Content(ContentPart::Text("before".into())),
+				InterStreamThoughtBlock::Content(ContentPart::ToolCall(call)),
+				InterStreamThoughtBlock::Custom(crate::chat::CustomPart {
+					model_iden: None,
+					data: serde_json::json!({"type":"redacted_thinking","data":"opaque"}),
+				}),
+				InterStreamThoughtBlock::Signed {
+					reasoning_content: Some("".into()),
+					signature: "sig-b".into(),
+				},
+				InterStreamThoughtBlock::Content(ContentPart::Text("after".into())),
+			]),
+			..Default::default()
+		});
+		let parts = end.captured_content.as_ref().unwrap().parts();
+		assert_eq!(parts.len(), 8);
+		assert!(matches!(&parts[0], ContentPart::ThoughtSignature(s) if s == "sig-a"));
+		assert!(matches!(&parts[2], ContentPart::Text(s) if s == "before"));
+		assert!(matches!(&parts[3], ContentPart::ToolCall(_)));
+		assert!(matches!(&parts[4], ContentPart::Custom(_)));
+		assert!(matches!(&parts[5], ContentPart::ThoughtSignature(s) if s == "sig-b"));
+		assert!(matches!(&parts[6], ContentPart::ReasoningContent(s) if s.is_empty()));
+		assert!(matches!(&parts[7], ContentPart::Text(s) if s == "after"));
+		assert_eq!(end.captured_tool_calls().unwrap().len(), 1);
+		assert_eq!(end.captured_texts().unwrap(), vec!["before", "after"]);
+		assert_eq!(
+			end.captured_tool_calls().unwrap()[0].thought_signatures,
+			Some(vec!["sig-a".into(), "sig-b".into()])
 		);
 	}
 

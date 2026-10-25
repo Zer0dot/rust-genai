@@ -264,77 +264,42 @@ impl AnthropicAdapter {
 					let mut values: Vec<Value> = Vec::new();
 					let mut has_tool_use = false;
 					let mut has_text = false;
-					let mut thought_signatures: Vec<String> = Vec::new();
-					let mut reasoning_contents: Vec<String> = Vec::new();
-					// The thinking blocks in the order they came: `None` for the next signed
-					// block, `Some(block)` for one kept as a custom part (`redacted_thinking`,
-					// or a block passed through as is).
-					let mut thinking_blocks: Vec<Option<Value>> = Vec::new();
-					let mut other_parts: Vec<ContentPart> = Vec::new();
-
-					for part in msg.content {
-						match part {
-							ContentPart::ThoughtSignature(signature) => {
-								thought_signatures.push(signature);
-								thinking_blocks.push(None);
-							}
-							ContentPart::ReasoningContent(reasoning) => reasoning_contents.push(reasoning),
-							ContentPart::Custom(custom_part) if is_thinking_block(&custom_part.data) => {
-								thinking_blocks.push(Some(custom_part.data));
-							}
-							other => other_parts.push(other),
-						}
-					}
-
-					// `ToolCall.thought_signatures` is a convenience mirror. Use it only when
-					// canonical message content does not already carry signatures.
-					if thought_signatures.is_empty()
-						&& let Some(mirrored) = other_parts.iter().find_map(|part| match part {
-							ContentPart::ToolCall(tool_call) => tool_call.thought_signatures.clone(),
+					let parts = msg.content.into_parts();
+					let mut thought_signatures: Vec<String> = parts
+						.iter()
+						.filter_map(|part| part.as_thought_signature().map(str::to_string))
+						.collect();
+					let reasoning_contents: Vec<String> = parts
+						.iter()
+						.filter_map(|part| match part {
+							ContentPart::ReasoningContent(reasoning) => Some(reasoning.clone()),
+							_ => None,
+						})
+						.collect();
+					let mirrored = thought_signatures.is_empty();
+					if mirrored
+						&& let Some(signatures) = parts.iter().find_map(|part| match part {
+							ContentPart::ToolCall(call) => call.thought_signatures.clone(),
 							_ => None,
 						}) {
-						// The mirror keeps no position, so its blocks lead.
-						thinking_blocks = std::iter::repeat_n(None, mirrored.len()).chain(thinking_blocks).collect();
-						thought_signatures = mirrored;
+						thought_signatures = signatures;
 					}
-
-					// Anthropic only accepts a thinking block when it carries both its reasoning
-					// text and the matching signature, so the two lists must line up one-to-one.
-					//
-					// They can legitimately fail to line up: a conversation carried over from a
-					// provider that returns unsigned reasoning (OpenAI, DeepSeek, ...), or an
-					// assistant message built by hand with `.with_reasoning_content(..)`. Pairing
-					// by position anyway would sign the wrong text, which Anthropic rejects, so
-					// drop the thinking blocks and send the rest of the message instead.
-					if reasoning_contents.len() == thought_signatures.len() {
-						// Anthropic requires every thinking block before text/tool-use blocks,
-						// and gets them back in the order they came.
-						let mut signed =
-							reasoning_contents
-								.into_iter()
-								.zip(thought_signatures)
-								.map(|(thinking, signature)| {
-									json!({
-										"type": "thinking",
-										"thinking": thinking,
-										"signature": signature,
-									})
-								});
-						for block in thinking_blocks {
-							values.extend(block.or_else(|| signed.next()));
-						}
-					} else if !reasoning_contents.is_empty() || !thought_signatures.is_empty() {
+					let paired = reasoning_contents.len() == thought_signatures.len();
+					if !paired {
 						tracing::warn!(
 							reasoning_count = reasoning_contents.len(),
 							signature_count = thought_signatures.len(),
-							"anthropic - assistant message has unpaired reasoning content and thought signatures; \
-							 omitting thinking blocks from this message"
+							"anthropic - omitting unpaired reasoning content and thought signatures"
 						);
-						// A block kept as a custom part needs no pairing, so it still goes back.
-						values.extend(thinking_blocks.into_iter().flatten());
 					}
-
-					for part in other_parts {
+					let mut signed = reasoning_contents.into_iter().zip(thought_signatures).filter(|_| paired).map(
+						|(thinking, signature)| json!({"type":"thinking", "thinking":thinking, "signature":signature}),
+					);
+					// A tool-only mirror has no native position; canonical pairs do.
+					if mirrored {
+						values.extend(signed.by_ref());
+					}
+					for part in parts {
 						match part {
 							ContentPart::Text(text) => {
 								has_text = true;
@@ -361,7 +326,8 @@ impl AnthropicAdapter {
 							// Unsupported for assistant role in Anthropic message content
 							ContentPart::Binary(_) => {}
 							ContentPart::ToolResponse(_) => {}
-							ContentPart::ThoughtSignature(_) | ContentPart::ReasoningContent(_) => {}
+							ContentPart::ThoughtSignature(_) => values.extend(signed.next()),
+							ContentPart::ReasoningContent(_) => {}
 							ContentPart::Custom(custom_part) => values.push(custom_part.data),
 						}
 					}
@@ -917,15 +883,6 @@ fn anthropic_tool_choice(tool_choice: Option<&ToolChoice>) -> Option<Value> {
 			"name": name
 		})),
 	}
-}
-
-/// A thinking block kept as a custom part: `redacted_thinking`, as both the streamed and
-/// the non-streamed response keep it, or a `thinking` block passed through as is.
-fn is_thinking_block(data: &Value) -> bool {
-	matches!(
-		data.get("type").and_then(Value::as_str),
-		Some("thinking" | "redacted_thinking")
-	)
 }
 
 // endregion: --- Support

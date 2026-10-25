@@ -1088,3 +1088,41 @@ fn test_non_stream_usage_zero_thinking_tokens_is_none() -> Result<()> {
 
 	Ok(())
 }
+
+#[test]
+fn assistant_signed_blocks_keep_native_positions_and_ignore_tool_mirrors() {
+	let parts = vec![
+		ContentPart::ThoughtSignature("sig-a".into()),
+		ContentPart::ReasoningContent("one".into()),
+		ContentPart::Text("before".into()),
+		ContentPart::ToolCall(ToolCall {
+			call_id: "a".into(),
+			fn_name: "lookup".into(),
+			fn_arguments: json!({"q":1}),
+			thought_signatures: Some(vec!["sig-a".into(), "sig-b".into()]),
+		}),
+		ContentPart::from_custom(json!({"type":"redacted_thinking","data":"opaque"}), None),
+		ContentPart::ThoughtSignature("sig-b".into()),
+		ContentPart::ReasoningContent("".into()),
+		ContentPart::Text("after".into()),
+	];
+	let target = ServiceTarget {
+		endpoint: AnthropicAdapter::default_endpoint(AdapterKind::Anthropic),
+		auth: AuthData::from_single("fixture"),
+		model: ModelIden::new(AdapterKind::Anthropic, "claude-sonnet-4-6"),
+	};
+	let request = ChatRequest::new(vec![ChatMessage::assistant(MessageContent::from_parts(parts))]);
+	let web =
+		AnthropicAdapter::to_web_request_data(target, ServiceType::Chat, request, ChatOptionsSet::default()).unwrap();
+	assert_eq!(
+		web.payload["messages"][0]["content"],
+		json!([
+			{"type":"thinking","thinking":"one","signature":"sig-a"},
+			{"type":"text","text":"before"},
+			{"type":"tool_use","id":"a","name":"lookup","input":{"q":1}},
+			{"type":"redacted_thinking","data":"opaque"},
+			{"type":"thinking","thinking":"","signature":"sig-b"},
+			{"type":"text","text":"after"},
+		])
+	);
+}

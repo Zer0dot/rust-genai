@@ -822,7 +822,7 @@ mod tests {
 					reasoning_content,
 					signature,
 				} => Some((reasoning_content.as_deref(), signature.as_str())),
-				InterStreamThoughtBlock::Custom(_) => None,
+				InterStreamThoughtBlock::Custom(_) | InterStreamThoughtBlock::Content(_) => None,
 			})
 			.collect();
 		assert_eq!(blocks, [(Some("thinking"), "sig-1"), (None, "blob")]);
