@@ -630,3 +630,105 @@ fn payload(
 }
 
 // endregion: --- Support
+
+#[test]
+fn tool_result_breakpoints_preserve_chat_continuations_on_supported_endpoints() -> Result<()> {
+	use crate::chat::ToolResponse;
+
+	for model in ["gpt-5.6", "gpt-6", "gpt-5.5"] {
+		for endpoint in [
+			"https://api.openai.com/v1/",
+			"https://api.openai.com.example/v1/",
+			"https://gateway.example/v1/",
+			"https://chatgpt.com/backend-api/codex/",
+		] {
+			for marked in [false, true] {
+				let target = ServiceTarget {
+					model: ModelIden::new(AdapterKind::OpenAI, model),
+					auth: AuthData::from_single("test-key"),
+					endpoint: Endpoint::from_owned(endpoint),
+				};
+				let calls = ["first", "last"].map(|id| ToolCall {
+					call_id: id.to_string(),
+					fn_name: "lookup".to_string(),
+					fn_arguments: json!({}),
+					thought_signatures: None,
+				});
+				let mut results = ChatMessage::tool(MessageContent::from_parts(vec![
+					ContentPart::ToolResponse(ToolResponse::new("first", "first result")),
+					ContentPart::ToolResponse(ToolResponse::new("last", "last result")),
+				]));
+				if marked {
+					results = results.with_options(CacheControl::Ephemeral);
+				}
+				let request = ChatRequest::new(vec![
+					ChatMessage::user("look up both"),
+					ChatMessage::assistant(calls.to_vec()),
+					results,
+				]);
+				let options = ChatOptions::default()
+					.with_prompt_cache_key("stable-key")
+					.with_cache_control(CacheControl::Ephemeral24h);
+				let payload = OpenAIAdapter::util_to_web_request_data(
+					target,
+					crate::adapter::ServiceType::Chat,
+					request,
+					ChatOptionsSet::default().with_chat_options(Some(&options)),
+					None,
+				)?
+				.payload;
+
+				let explicit = marked && model != "gpt-5.5" && endpoint == "https://api.openai.com/v1/";
+				assert_eq!(payload["prompt_cache_key"], "stable-key");
+				assert_eq!(payload.get("prompt_cache_options").is_some(), explicit);
+				assert_eq!(
+					payload["messages"][2],
+					json!({
+						"role": "tool", "tool_call_id": "first", "content": "first result"
+					})
+				);
+				let content = if explicit {
+					json!([{"type": "text", "text": "last result", "prompt_cache_breakpoint": {"mode": "explicit"}}])
+				} else {
+					json!("last result")
+				};
+				assert_eq!(
+					payload["messages"][3],
+					json!({
+						"role": "tool", "tool_call_id": "last", "content": content
+					})
+				);
+				assert_eq!(
+					payload["messages"].as_array().ok_or("messages must be an array")?.len(),
+					4
+				);
+				if model == "gpt-5.5" {
+					assert_eq!(payload["prompt_cache_retention"], "24h");
+				}
+			}
+		}
+	}
+	Ok(())
+}
+
+#[test]
+fn openai_usage_distinguishes_absent_cache_counters_from_reported_zeroes() {
+	for (details, write, read) in [
+		(json!({}), None, None),
+		(json!({"cached_tokens": 0}), None, Some(0)),
+		(json!({"cache_write_tokens": 0}), Some(0), None),
+		(
+			json!({"cache_write_tokens": 17, "cached_tokens": 29}),
+			Some(17),
+			Some(29),
+		),
+	] {
+		let usage = OpenAIAdapter::into_usage(AdapterKind::OpenAI, json!({"prompt_tokens_details": details}));
+		assert_eq!(
+			usage.prompt_tokens_details.as_ref().and_then(|d| d.cache_creation_tokens),
+			write
+		);
+		assert_eq!(usage.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens), read);
+		assert_eq!(usage.prompt_tokens_details.is_some(), write.is_some() || read.is_some());
+	}
+}

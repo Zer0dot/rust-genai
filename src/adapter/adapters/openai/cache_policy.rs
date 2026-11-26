@@ -23,7 +23,7 @@ pub(crate) fn openai_prompt_cache_ttl(_cache_control: &CacheControl) -> &'static
 	"30m"
 }
 
-pub(crate) fn supports_openai_responses_prompt_cache_options(endpoint: &Endpoint) -> bool {
+pub(crate) fn supports_openai_prompt_cache_options(endpoint: &Endpoint) -> bool {
 	const SUPPORTED_ORIGINS: [&str; 2] = ["https://api.openai.com", "http://api.openai.com"];
 
 	SUPPORTED_ORIGINS.iter().any(|origin| {
@@ -140,7 +140,7 @@ mod tests {
 	fn test_adapter_adapters_openai_supports_prompt_cache_options_for_official_endpoint() -> Result<()> {
 		let endpoint = Endpoint::from_static("https://api.openai.com/v1/");
 
-		assert!(supports_openai_responses_prompt_cache_options(&endpoint));
+		assert!(supports_openai_prompt_cache_options(&endpoint));
 		Ok(())
 	}
 
@@ -153,7 +153,7 @@ mod tests {
 		];
 
 		for endpoint in &endpoints {
-			assert!(!supports_openai_responses_prompt_cache_options(endpoint));
+			assert!(!supports_openai_prompt_cache_options(endpoint));
 		}
 
 		Ok(())
@@ -166,10 +166,10 @@ mod tests {
 		let openai_host_lookalike = Endpoint::from_static("https://api.openai.com.example/v1/");
 		let openai_path = Endpoint::from_static("https://api.openai.com/custom/v1/");
 
-		assert!(!supports_openai_responses_prompt_cache_options(&host_lookalike));
-		assert!(!supports_openai_responses_prompt_cache_options(&path_lookalike));
-		assert!(!supports_openai_responses_prompt_cache_options(&openai_host_lookalike));
-		assert!(supports_openai_responses_prompt_cache_options(&openai_path));
+		assert!(!supports_openai_prompt_cache_options(&host_lookalike));
+		assert!(!supports_openai_prompt_cache_options(&path_lookalike));
+		assert!(!supports_openai_prompt_cache_options(&openai_host_lookalike));
+		assert!(supports_openai_prompt_cache_options(&openai_path));
 		Ok(())
 	}
 

@@ -2,7 +2,7 @@ use super::{OpenAIRespStreamer, RespResponse, extract_resp_reasoning_texts};
 use crate::adapter::adapters::openai::OpenAIAdapter;
 use crate::adapter::adapters::openai::cache_policy::{
 	OpenAiPromptCachePolicy, OpenAiProtocol, openai_prompt_cache_policy, requires_explicit_cache,
-	supports_openai_responses_prompt_cache_options,
+	supports_openai_prompt_cache_options,
 };
 use crate::adapter::adapters::openai::schema::{
 	OpenAiResponseFormatPlan, response_format_plan, tool_parameters_schema,
@@ -88,7 +88,7 @@ impl Adapter for OpenAIRespAdapter {
 		let (_, model_name) = model.model_name.namespace_and_name();
 		let adapter_kind = model.adapter_kind;
 		let protocol = OpenAiProtocol::Responses;
-		let prompt_cache_policy = if supports_openai_responses_prompt_cache_options(&endpoint) {
+		let prompt_cache_policy = if supports_openai_prompt_cache_options(&endpoint) {
 			openai_prompt_cache_policy(adapter_kind, model_name, &chat_req, &chat_options, protocol)
 		} else {
 			None
@@ -653,19 +653,33 @@ impl OpenAIRespAdapter {
 
 				// Tool Response (Function tool call output)
 				ChatRole::Tool => {
-					for part in msg.content {
-						if let ContentPart::ToolResponse(tool_response) = part {
-							let response_type = if custom_call_ids.contains(&tool_response.call_id) {
-								"custom_tool_call_output"
-							} else {
-								"function_call_output"
-							};
-							input_items.push(json!({
-								"type": response_type,
-								"call_id": tool_response.call_id,
-								"output": tool_response.content,
-							}));
-						}
+					let mut responses = msg
+						.content
+						.into_iter()
+						.filter_map(|part| match part {
+							ContentPart::ToolResponse(response) => Some(response),
+							_ => None,
+						})
+						.peekable();
+					while let Some(tool_response) = responses.next() {
+						let response_type = if custom_call_ids.contains(&tool_response.call_id) {
+							"custom_tool_call_output"
+						} else {
+							"function_call_output"
+						};
+						// Tool outputs accept input content blocks, not item-level breakpoints.
+						let output = if cache_controlled && responses.peek().is_none() {
+							let mut values = vec![json!({"type": "input_text", "text": tool_response.content})];
+							apply_resp_cache_breakpoint(model_iden, &mut values, "tool result")?;
+							json!(values)
+						} else {
+							json!(tool_response.content)
+						};
+						input_items.push(json!({
+							"type": response_type,
+							"call_id": tool_response.call_id,
+							"output": output,
+						}));
 					}
 
 					// TODO: Probably need to trace/warn that this will be ignored

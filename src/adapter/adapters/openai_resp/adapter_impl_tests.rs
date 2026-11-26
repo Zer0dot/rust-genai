@@ -558,3 +558,89 @@ fn test_openai_resp_into_openai_request_parts_does_not_duplicate_mirrored_though
 
 	Ok(())
 }
+
+#[test]
+fn tool_result_breakpoints_preserve_responses_continuations_on_supported_endpoints() -> Result<()> {
+	for model in ["gpt-5.6", "gpt-6", "gpt-5.5"] {
+		for endpoint in [
+			"https://api.openai.com/v1/",
+			"https://api.openai.com.example/v1/",
+			"https://gateway.example/v1/",
+			"https://chatgpt.com/backend-api/codex/",
+		] {
+			for marked in [false, true] {
+				for custom in [false, true] {
+					let target = ServiceTarget {
+						model: ModelIden::new(AdapterKind::OpenAIResp, model),
+						auth: AuthData::from_single("test-key"),
+						endpoint: Endpoint::from_owned(endpoint),
+					};
+					let calls = ["first", "last"].map(|id| ToolCall {
+						call_id: id.to_string(),
+						fn_name: "lookup".to_string(),
+						fn_arguments: json!({}),
+						thought_signatures: None,
+					});
+					let mut results = ChatMessage::tool(MessageContent::from_parts(vec![
+						ContentPart::ToolResponse(ToolResponse::new("first", "first result")),
+						ContentPart::ToolResponse(ToolResponse::new("last", "last result")),
+					]));
+					if marked {
+						results = results.with_options(CacheControl::Ephemeral);
+					}
+					let mut tool = Tool::new("lookup");
+					if custom {
+						tool = tool.with_custom_format(json!({"type": "text"}));
+					}
+					let request = ChatRequest::new(vec![
+						ChatMessage::user("look up both"),
+						ChatMessage::assistant(calls.to_vec()),
+						results,
+					])
+					.append_tool(tool);
+					let options = ChatOptions::default()
+						.with_prompt_cache_key("stable-key")
+						.with_cache_control(CacheControl::Ephemeral24h);
+					let payload = OpenAIRespAdapter::to_web_request_data(
+						target,
+						ServiceType::Chat,
+						request,
+						ChatOptionsSet::default().with_chat_options(Some(&options)),
+					)?
+					.payload;
+
+					let explicit = marked && model != "gpt-5.5" && endpoint == "https://api.openai.com/v1/";
+					assert_eq!(payload["prompt_cache_key"], "stable-key");
+					assert_eq!(payload.get("prompt_cache_options").is_some(), explicit);
+					let output_type = if custom {
+						"custom_tool_call_output"
+					} else {
+						"function_call_output"
+					};
+					assert_eq!(
+						payload["input"][3],
+						json!({
+							"type": output_type, "call_id": "first", "output": "first result"
+						})
+					);
+					let output = if explicit {
+						json!([{"type": "input_text", "text": "last result", "prompt_cache_breakpoint": {"mode": "explicit"}}])
+					} else {
+						json!("last result")
+					};
+					assert_eq!(
+						payload["input"][4],
+						json!({
+							"type": output_type, "call_id": "last", "output": output
+						})
+					);
+					assert_eq!(payload["input"].as_array().ok_or("input must be an array")?.len(), 5);
+					if model == "gpt-5.5" {
+						assert_eq!(payload["prompt_cache_retention"], "24h");
+					}
+				}
+			}
+		}
+	}
+	Ok(())
+}

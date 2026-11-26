@@ -3,7 +3,7 @@ use serde_with::skip_serializing_none;
 
 /// Normalized token usage across providers (OpenAI-compatible).
 ///
-/// - Deserialization treats 0 as None for cross-provider consistency. OpenAI often returns 0 for non-applicable counters.
+/// - Cache counters preserve reported zeroes; absent counters remain `None`. Other detail counters treat 0 as `None`.
 ///
 /// - `prompt_tokens` and `completion_tokens` are the total input/output tokens. The corresponding `*_details` carry provider-specific breakdowns.
 ///
@@ -44,10 +44,10 @@ impl Usage {
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheCreationDetails {
 	/// Tokens written to 5-minute ephemeral cache.
-	#[serde(default, deserialize_with = "crate::support::zero_as_none")]
+	#[serde(default)]
 	pub ephemeral_5m_tokens: Option<i32>,
 	/// Tokens written to 1-hour ephemeral cache.
-	#[serde(default, deserialize_with = "crate::support::zero_as_none")]
+	#[serde(default)]
 	pub ephemeral_1h_tokens: Option<i32>,
 }
 
@@ -63,13 +63,13 @@ impl CacheCreationDetails {
 pub struct PromptTokensDetails {
 	/// Anthropic: `cache_creation_input_tokens`.
 	/// Tokens used to build the cache (not yet cached). These may incur a small surcharge; subsequent requests benefit via `cached_tokens`.
-	#[serde(alias = "cache_write_tokens", default, deserialize_with = "crate::support::zero_as_none")]
+	#[serde(alias = "cache_write_tokens", default)]
 	pub cache_creation_tokens: Option<i32>,
 	/// Breakdown of cache creation tokens by TTL (5m vs 1h).
 	/// Only populated when the provider returns TTL-specific breakdown.
 	pub cache_creation_details: Option<CacheCreationDetails>,
 	/// Anthropic: `cache_read_input_tokens`.
-	#[serde(default, deserialize_with = "crate::support::zero_as_none")]
+	#[serde(default)]
 	pub cached_tokens: Option<i32>,
 	#[serde(default, deserialize_with = "crate::support::zero_as_none")]
 	pub audio_tokens: Option<i32>,
@@ -144,21 +144,40 @@ mod tests {
 	}
 
 	#[test]
-	fn test_openai_cache_write_tokens_zero_is_none() -> Result<(), serde_json::Error> {
+	fn test_openai_cache_write_tokens_zero_is_preserved() -> Result<(), serde_json::Error> {
 		let usage: Usage = serde_json::from_value(json!({
 			"prompt_tokens_details": {
 				"cache_write_tokens": 0
 			}
 		}))?;
 
-		assert!(
-			usage
-				.prompt_tokens_details
-				.as_ref()
-				.and_then(|details| details.cache_creation_tokens)
-				.is_none()
+		assert_eq!(
+			usage.prompt_tokens_details.as_ref().and_then(|d| d.cache_creation_tokens),
+			Some(0)
 		);
+		let restored: Usage = serde_json::from_value(serde_json::to_value(&usage)?)?;
+		assert_eq!(restored, usage);
 
+		Ok(())
+	}
+	#[test]
+	fn cache_ttl_counter_zeroes_survive_roundtrip_and_compaction() -> Result<(), serde_json::Error> {
+		let mut usage: Usage = serde_json::from_value(json!({
+			"prompt_tokens_details": {
+				"cache_creation_details": {"ephemeral_5m_tokens": 0, "ephemeral_1h_tokens": 0}
+			}
+		}))?;
+		usage.compact_details();
+		let details = usage
+			.prompt_tokens_details
+			.as_ref()
+			.unwrap()
+			.cache_creation_details
+			.as_ref()
+			.unwrap();
+		assert_eq!(details.ephemeral_5m_tokens, Some(0));
+		assert_eq!(details.ephemeral_1h_tokens, Some(0));
+		assert_eq!(serde_json::from_value::<Usage>(serde_json::to_value(&usage)?)?, usage);
 		Ok(())
 	}
 }
