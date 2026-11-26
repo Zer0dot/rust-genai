@@ -1126,3 +1126,35 @@ fn assistant_signed_blocks_keep_native_positions_and_ignore_tool_mirrors() {
 		])
 	);
 }
+
+#[test]
+fn anthropic_usage_preserves_cache_counter_presence_and_normalizes_totals() {
+	for (cache, write, read) in [
+		(json!({}), None, None),
+		(
+			json!({"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+			Some(0),
+			Some(0),
+		),
+		(json!({"cache_creation_input_tokens": 0}), Some(0), None),
+		(json!({"cache_read_input_tokens": 29}), None, Some(29)),
+		(
+			json!({"cache_creation_input_tokens": 17, "cache_read_input_tokens": 29}),
+			Some(17),
+			Some(29),
+		),
+	] {
+		let mut body = json!({"input_tokens": 11, "output_tokens": 7});
+		body.as_object_mut().unwrap().extend(cache.as_object().unwrap().clone());
+		let usage = AnthropicAdapter::into_usage(body);
+		assert_eq!(
+			usage.prompt_tokens_details.as_ref().and_then(|d| d.cache_creation_tokens),
+			write
+		);
+		assert_eq!(usage.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens), read);
+		assert_eq!(usage.prompt_tokens_details.is_some(), write.is_some() || read.is_some());
+		assert_eq!(usage.prompt_tokens, Some(11 + write.unwrap_or(0) + read.unwrap_or(0)));
+		assert_eq!(usage.completion_tokens, Some(7));
+		assert_eq!(usage.total_tokens, Some(18 + write.unwrap_or(0) + read.unwrap_or(0)));
+	}
+}

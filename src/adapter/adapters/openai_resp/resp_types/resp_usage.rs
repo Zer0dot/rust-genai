@@ -4,7 +4,7 @@ use serde_with::skip_serializing_none;
 
 /// Normalized token usage across providers (OpenAI-compatible).
 ///
-/// - Deserialization treats 0 as None for cross-provider consistency. OpenAI often returns 0 for non-applicable counters.
+/// - Cache counters preserve reported zeroes; absent counters remain `None`. Other detail counters treat 0 as `None`.
 ///
 /// - `prompt_tokens` and `output_tokens` are the total input/output tokens. The corresponding `*_details` carry provider-specific breakdowns.
 ///
@@ -43,12 +43,11 @@ impl RespUsage {
 #[skip_serializing_none]
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct InputTokensDetails {
-	/// Anthropic: `cache_creation_input_tokens`.
-	/// Tokens used to build the cache (not yet cached). These may incur a small surcharge; subsequent requests benefit via `cached_tokens`.
-	#[serde(default, deserialize_with = "crate::support::zero_as_none")]
+	/// OpenAI: tokens written to the prompt cache.
+	#[serde(default)]
 	pub cache_write_tokens: Option<i32>,
-	/// Anthropic: `cache_read_input_tokens`.
-	#[serde(default, deserialize_with = "crate::support::zero_as_none")]
+	/// OpenAI: tokens read from the prompt cache.
+	#[serde(default)]
 	pub cached_tokens: Option<i32>,
 	#[serde(default, deserialize_with = "crate::support::zero_as_none")]
 	pub audio_tokens: Option<i32>,
@@ -147,6 +146,41 @@ mod tests {
 			Some(77)
 		);
 
+		Ok(())
+	}
+	#[test]
+	fn cache_counter_presence_survives_responses_usage_normalization() -> Result<(), serde_json::Error> {
+		for (details, write, read) in [
+			(json!({}), None, None),
+			(json!({"cached_tokens": 0}), None, Some(0)),
+			(json!({"cache_write_tokens": 0}), Some(0), None),
+			(
+				json!({"cache_write_tokens": 17, "cached_tokens": 29}),
+				Some(17),
+				Some(29),
+			),
+		] {
+			let mut usage: RespUsage = serde_json::from_value(json!({"input_tokens_details": details}))?;
+			usage.compact_details();
+			let mut normalized: Usage = usage.into();
+			normalized.compact_details();
+			assert_eq!(
+				normalized.prompt_tokens_details.as_ref().and_then(|d| d.cache_creation_tokens),
+				write
+			);
+			assert_eq!(
+				normalized.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens),
+				read
+			);
+			assert_eq!(
+				normalized.prompt_tokens_details.is_some(),
+				write.is_some() || read.is_some()
+			);
+			assert_eq!(
+				serde_json::from_value::<Usage>(serde_json::to_value(&normalized)?)?,
+				normalized
+			);
+		}
 		Ok(())
 	}
 }

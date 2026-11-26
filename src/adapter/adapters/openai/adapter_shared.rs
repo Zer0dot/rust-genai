@@ -2,6 +2,7 @@
 
 use super::cache_policy::{
 	OpenAiPromptCachePolicy, OpenAiProtocol, openai_prompt_cache_policy, requires_explicit_cache,
+	supports_openai_prompt_cache_options,
 };
 use super::schema::{OpenAiResponseFormatPlan, response_format_plan, tool_parameters_schema};
 use crate::adapter::adapters::openai::OpenAIAdapter;
@@ -89,8 +90,11 @@ impl OpenAIAdapter {
 		let ServiceTarget { model, auth, endpoint } = target;
 		let (_, model_name) = model.model_name.namespace_and_name();
 		let protocol = OpenAiProtocol::ChatCompletions;
-		let prompt_cache_policy =
-			openai_prompt_cache_policy(model.adapter_kind, model_name, &chat_req, &options_set, protocol);
+		let prompt_cache_policy = if supports_openai_prompt_cache_options(&endpoint) {
+			openai_prompt_cache_policy(model.adapter_kind, model_name, &chat_req, &options_set, protocol)
+		} else {
+			None
+		};
 		let response_format_plan = response_format_plan(&options_set);
 
 		// -- url
@@ -497,14 +501,28 @@ impl OpenAIAdapter {
 
 				// Tool - For now, support only tool responses
 				ChatRole::Tool => {
-					for part in msg.content {
-						if let ContentPart::ToolResponse(tool_response) = part {
-							messages.push(json!({
-								"role": "tool",
-								"content": tool_response.content,
-								"tool_call_id": tool_response.call_id,
-							}))
-						}
+					let mut responses = msg
+						.content
+						.into_iter()
+						.filter_map(|part| match part {
+							ContentPart::ToolResponse(response) => Some(response),
+							_ => None,
+						})
+						.peekable();
+					while let Some(tool_response) = responses.next() {
+						// A message-level breakpoint belongs after its final tool result.
+						let content = if cache_controlled && responses.peek().is_none() {
+							let mut values = vec![json!({"type": "text", "text": tool_response.content})];
+							apply_chat_cache_breakpoint(model_iden, &mut values, "tool result")?;
+							json!(values)
+						} else {
+							json!(tool_response.content)
+						};
+						messages.push(json!({
+							"role": "tool",
+							"content": content,
+							"tool_call_id": tool_response.call_id,
+						}));
 					}
 
 					// TODO: Probably need to trace/warn that this will be ignored

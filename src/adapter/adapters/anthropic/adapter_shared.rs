@@ -67,8 +67,8 @@ impl AnthropicAdapter {
 		// IMPORTANT: For Anthropic, the `input_tokens` does not include `cache_creation_input_tokens` or `cache_read_input_tokens`.
 		// Therefore, it must be normalized in the OpenAI style, where it includes both cached and written tokens (for symmetry).
 		let input_tokens: i32 = usage_value.x_take("input_tokens").ok().unwrap_or(0);
-		let cache_creation_input_tokens: i32 = usage_value.x_take("cache_creation_input_tokens").unwrap_or(0);
-		let cache_read_input_tokens: i32 = usage_value.x_take("cache_read_input_tokens").unwrap_or(0);
+		let cache_creation_input_tokens: Option<i32> = usage_value.x_take("cache_creation_input_tokens").ok();
+		let cache_read_input_tokens: Option<i32> = usage_value.x_take("cache_read_input_tokens").ok();
 		let completion_tokens: i32 = usage_value.x_take("output_tokens").ok().unwrap_or(0);
 		// Anthropic reports the thinking share of `output_tokens` as
 		// `output_tokens_details.thinking_tokens` (adaptive thinking). It maps to
@@ -86,24 +86,26 @@ impl AnthropicAdapter {
 		let cache_creation_details = usage_value.get("cache_creation").and_then(parse_cache_creation_details);
 
 		// compute the prompt_tokens
-		let prompt_tokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens;
+		let prompt_tokens =
+			input_tokens + cache_creation_input_tokens.unwrap_or(0) + cache_read_input_tokens.unwrap_or(0);
 
 		// Compute total_tokens
 		let total_tokens = prompt_tokens + completion_tokens;
 
-		// For now the logic is to have a Some of PromptTokensDetails if at least one of those value is not 0
-		// TODO: Needs to be normalized across adapters.
-		let prompt_tokens_details =
-			if cache_creation_input_tokens > 0 || cache_read_input_tokens > 0 || cache_creation_details.is_some() {
-				Some(PromptTokensDetails {
-					cache_creation_tokens: Some(cache_creation_input_tokens),
-					cache_creation_details,
-					cached_tokens: Some(cache_read_input_tokens),
-					audio_tokens: None,
-				})
-			} else {
-				None
-			};
+		// Preserve reported zeroes without inventing counters the provider omitted.
+		let prompt_tokens_details = if cache_creation_input_tokens.is_some()
+			|| cache_read_input_tokens.is_some()
+			|| cache_creation_details.is_some()
+		{
+			Some(PromptTokensDetails {
+				cache_creation_tokens: cache_creation_input_tokens,
+				cache_creation_details,
+				cached_tokens: cache_read_input_tokens,
+				audio_tokens: None,
+			})
+		} else {
+			None
+		};
 
 		Usage {
 			prompt_tokens: Some(prompt_tokens),
@@ -836,7 +838,7 @@ pub(super) fn parse_cache_creation_details(cache_creation: &Value) -> Option<Cac
 		.and_then(|v| v.as_i64())
 		.map(|v| v as i32);
 
-	// Only return Some if at least one TTL has tokens
+	// A reported zero is distinct from an omitted TTL counter.
 	if ephemeral_5m_tokens.is_some() || ephemeral_1h_tokens.is_some() {
 		Some(CacheCreationDetails {
 			ephemeral_5m_tokens,

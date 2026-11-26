@@ -440,8 +440,8 @@ impl AnthropicStreamer {
 			// some gateways (e.g. Alibaba DashScope / Qwen) report them only in `message_delta`.
 			// NOTE: Anthropic's input_tokens does NOT include cached tokens, so we must add them.
 			// See also: AnthropicAdapter::into_usage() for non-streaming equivalent.
-			let cache_creation: i32 = usage_value.x_get("cache_creation_input_tokens").unwrap_or(0);
-			let cache_read: i32 = usage_value.x_get("cache_read_input_tokens").unwrap_or(0);
+			let cache_creation: Option<i32> = usage_value.x_get("cache_creation_input_tokens").ok();
+			let cache_read: Option<i32> = usage_value.x_get("cache_read_input_tokens").ok();
 
 			// Parse cache_creation breakdown if present (TTL-specific breakdown)
 			let cache_creation_details = usage_value
@@ -450,7 +450,7 @@ impl AnthropicStreamer {
 				.as_ref()
 				.and_then(parse_cache_creation_details);
 
-			let has_cache = cache_creation > 0 || cache_read > 0 || cache_creation_details.is_some();
+			let has_cache = cache_creation.is_some() || cache_read.is_some() || cache_creation_details.is_some();
 
 			// Nothing to capture from this snapshot, leave `usage` as-is (possibly None).
 			if input_tokens.is_none() && output_tokens.is_none() && !has_cache {
@@ -459,35 +459,29 @@ impl AnthropicStreamer {
 
 			let usage = self.captured_data.usage.get_or_insert(Usage::default());
 
-			if let Some(input_tokens) = input_tokens {
-				usage.prompt_tokens = Some(input_tokens + cache_creation + cache_read);
-			}
-			// NOTE: Cache tokens without `input_tokens` (gateway shape) are deliberately NOT added
-			// to `prompt_tokens`, since gateway token accounting is provider-specific.
-
 			if let Some(output_tokens) = output_tokens {
 				usage.completion_tokens = Some(output_tokens);
 			}
 
 			if has_cache {
-				// Anthropic sends the `cache_creation` breakdown only in `message_start`, while
-				// `message_delta` repeats the totals without it. Keep the earlier breakdown so the
-				// later snapshot does not erase it.
-				let cache_creation_details = cache_creation_details.or_else(|| {
-					usage
-						.prompt_tokens_details
-						.as_ref()
-						.and_then(|details| details.cache_creation_details.clone())
-				});
-
-				// Set prompt_tokens_details (match into_usage behavior: always Some(value))
-				usage.prompt_tokens_details = Some(PromptTokensDetails {
-					cache_creation_tokens: Some(cache_creation),
-					cache_creation_details,
-					cached_tokens: Some(cache_read),
-					audio_tokens: None,
-				});
+				// Snapshots may omit counters or the TTL breakdown. Preserve earlier values,
+				// but let an explicitly reported zero replace an earlier nonzero counter.
+				let details = usage.prompt_tokens_details.get_or_insert_with(PromptTokensDetails::default);
+				details.cache_creation_tokens = cache_creation.or(details.cache_creation_tokens);
+				details.cached_tokens = cache_read.or(details.cached_tokens);
+				if let Some(cache_creation_details) = cache_creation_details {
+					details.cache_creation_details = Some(cache_creation_details);
+				}
 			}
+
+			if let Some(input_tokens) = input_tokens {
+				let details = usage.prompt_tokens_details.as_ref();
+				let cache_creation = details.and_then(|d| d.cache_creation_tokens).unwrap_or(0);
+				let cache_read = details.and_then(|d| d.cached_tokens).unwrap_or(0);
+				usage.prompt_tokens = Some(input_tokens + cache_creation + cache_read);
+			}
+			// Cache tokens without `input_tokens` (gateway shape) are deliberately NOT added
+			// to `prompt_tokens`, since gateway token accounting is provider-specific.
 		}
 
 		Ok(())
@@ -593,5 +587,68 @@ mod tests {
 		// Signatures are opaque base64, so no resend/overlap collapsing is applied.
 		assert_eq!(signature("ab", &["ab"]).as_deref(), Some("abab"));
 		assert_eq!(signature("", &["QUJD", "QUJD"]).as_deref(), Some("QUJDQUJD"));
+	}
+	#[test]
+	fn cache_usage_snapshots_preserve_absence_zeroes_and_prior_counters() -> crate::Result<()> {
+		use super::AnthropicStreamer;
+		use crate::ModelIden;
+		use crate::adapter::AdapterKind;
+		use crate::chat::{ChatOptions, ChatOptionsSet};
+		use crate::webc::{EventSourceStream, StreamRequest};
+		use serde_json::json;
+
+		for (cache, write, read) in [
+			(json!({}), None, None),
+			(
+				json!({"cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+				Some(0),
+				Some(0),
+			),
+			(json!({"cache_creation_input_tokens": 17}), Some(17), None),
+			(json!({"cache_read_input_tokens": 29}), None, Some(29)),
+		] {
+			// The request is never polled or sent; exercise usage snapshots directly.
+			let inner = EventSourceStream::new(StreamRequest::new(
+				reqwest::Client::new().get("http://unused.invalid"),
+				None,
+				None,
+			));
+			let options = ChatOptions::default().with_capture_usage(true);
+			let mut streamer = AnthropicStreamer::new(
+				inner,
+				ModelIden::new(AdapterKind::Anthropic, "claude-sonnet-4-6"),
+				ChatOptionsSet::default().with_chat_options(Some(&options)),
+			);
+			let mut usage = json!({"input_tokens": 11, "output_tokens": 0});
+			usage.as_object_mut().unwrap().extend(cache.as_object().unwrap().clone());
+			streamer.capture_usage("message_start", &json!({"message": {"usage": usage}}).to_string())?;
+			streamer.capture_usage("message_delta", &json!({"usage": {"output_tokens": 7}}).to_string())?;
+
+			let usage = streamer.captured_data.usage.as_ref().unwrap();
+			assert_eq!(
+				usage.prompt_tokens_details.as_ref().and_then(|d| d.cache_creation_tokens),
+				write
+			);
+			assert_eq!(usage.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens), read);
+			assert_eq!(usage.prompt_tokens_details.is_some(), write.is_some() || read.is_some());
+			assert_eq!(usage.prompt_tokens, Some(11 + write.unwrap_or(0) + read.unwrap_or(0)));
+			assert_eq!(usage.completion_tokens, Some(7));
+
+			streamer.capture_usage(
+				"message_delta",
+				&json!({"usage": {"cache_read_input_tokens": 0}}).to_string(),
+			)?;
+			let details = streamer
+				.captured_data
+				.usage
+				.as_ref()
+				.unwrap()
+				.prompt_tokens_details
+				.as_ref()
+				.unwrap();
+			assert_eq!(details.cache_creation_tokens, write);
+			assert_eq!(details.cached_tokens, Some(0));
+		}
+		Ok(())
 	}
 }
